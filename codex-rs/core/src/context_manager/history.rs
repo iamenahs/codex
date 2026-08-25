@@ -23,6 +23,7 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::InputModality;
+use codex_protocol::protocol::ContextBaseline;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
@@ -51,6 +52,24 @@ pub(crate) struct ContextManager {
     /// Bumped whenever history is rewritten, such as compaction or rollback.
     history_version: u64,
     token_info: Option<TokenUsageInfo>,
+    /// What the most recently *completed* request cost before its conversation:
+    /// the baseline that belongs with `token_info.last_token_usage`.
+    ///
+    /// Kept beside `token_info` rather than inside it because every path that
+    /// rebuilds token info would otherwise have to remember to carry it.
+    context_baseline: Option<ContextBaseline>,
+    /// The baseline of a request that has been built but whose usage has not
+    /// come back yet.
+    ///
+    /// Staged rather than published because a request can fail: promoting it
+    /// immediately would pair a new baseline with the previous request's usage.
+    pending_context_baseline: Option<ContextBaseline>,
+    /// Whether `token_info.last_token_usage` came from the provider or from
+    /// `estimate_token_count_with_base_instructions`.
+    ///
+    /// The local estimate deliberately omits the tool schemas, so it is not
+    /// denominated the same way a measured baseline is; see `token_info`.
+    last_usage_is_estimated: bool,
     /// Reference context snapshot used for diffing and producing model-visible
     /// settings update items.
     ///
@@ -100,6 +119,9 @@ impl ContextManager {
             token_info: TokenUsageInfo::new_or_append(
                 &None, &None, /*model_context_window*/ None,
             ),
+            context_baseline: None,
+            pending_context_baseline: None,
+            last_usage_is_estimated: false,
             reference_context_item: None,
             world_state_baseline: None,
         }
@@ -113,7 +135,31 @@ impl ContextManager {
     }
 
     pub(crate) fn token_info(&self) -> Option<TokenUsageInfo> {
-        self.token_info.clone()
+        self.token_info.clone().map(|mut info| {
+            if self.last_usage_is_estimated {
+                // `last_token_usage` was recomputed locally, and that estimate
+                // omits the tool schemas. Dividing it by a baseline that counts
+                // them mixes two different accountings, and the mismatch pushes
+                // the displayed percentage further from the truth than the
+                // historical constant does. Withhold the measurement until a
+                // provider figure denominated the same way arrives.
+                info.context_baseline = None;
+            } else if self.context_baseline.is_some() {
+                info.context_baseline = self.context_baseline;
+            }
+            info
+        })
+    }
+
+    /// Stage the baseline of a request that is about to be sent.
+    pub(crate) fn set_context_baseline(&mut self, baseline: ContextBaseline) {
+        self.pending_context_baseline = Some(baseline);
+    }
+
+    /// Note that `last_token_usage` is now a local estimate rather than a
+    /// provider figure. Called after a compaction recomputes it.
+    pub(crate) fn note_estimated_token_usage(&mut self) {
+        self.last_usage_is_estimated = true;
     }
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
@@ -269,6 +315,10 @@ impl ContextManager {
         let base_tokens =
             i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
 
+        // NOTE: this estimate leaves out the tool schemas, so it is low by the
+        // size of the tool surface. It is deliberately left alone here: it
+        // feeds `recompute_token_usage`, and therefore auto-compaction. See
+        // the pull request description for why that is a separate change.
         let items_tokens = self
             .items
             .iter()
@@ -379,6 +429,15 @@ impl ContextManager {
             &Some(usage.clone()),
             model_context_window,
         );
+        // A published baseline belongs to the request whose usage is being
+        // shown, so it is replaced wholesale rather than merged into. A
+        // request that stages none publishes `None` and the reading falls back
+        // to the constant: local compaction sends a `Prompt` carrying no tools
+        // and no output schema (`compact.rs`) but still reports provider
+        // usage, and pricing that request with the previous request's tool
+        // payload would subtract a fixed cost it never paid.
+        self.context_baseline = self.pending_context_baseline.take();
+        self.last_usage_is_estimated = false;
     }
 
     fn get_non_last_reasoning_items_tokens(&self) -> i64 {

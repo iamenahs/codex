@@ -331,6 +331,7 @@ use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
+use codex_protocol::protocol::ContextBaseline;
 use codex_protocol::protocol::DeprecationNoticeEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -1279,6 +1280,20 @@ impl Session {
     ) -> Option<i64> {
         let history = self.clone_history().await;
         history.estimate_token_count(turn_context)
+    }
+
+    /// Stage what the request just built costs, before it is sent.
+    ///
+    /// This is the number `LEGACY_CONTEXT_BASELINE_TOKENS` was standing in
+    /// for. It is measured per request because the tool surface is not fixed
+    /// for a session: enabling a plugin or connecting an MCP server changes
+    /// it, and switching model can change the wire form it is sent in.
+    ///
+    /// Staged rather than published: the request may fail, and a baseline is
+    /// only meaningful next to the usage of the request it was measured from.
+    pub(crate) async fn record_context_baseline(&self, baseline: ContextBaseline) {
+        let mut state = self.state.lock().await;
+        state.set_context_baseline(baseline);
     }
 
     pub(crate) async fn get_base_instructions(&self) -> BaseInstructions {
@@ -4038,11 +4053,11 @@ impl Session {
         };
         {
             let mut state = self.state.lock().await;
-            let mut info = state.token_info().unwrap_or(TokenUsageInfo {
-                total_token_usage: TokenUsage::default(),
-                last_token_usage: TokenUsage::default(),
-                model_context_window: None,
-            });
+            // Do this before reading `token_info`, so the figure written below
+            // is not paired with a baseline measured against a different
+            // accounting; see `ContextManager::token_info`.
+            state.note_estimated_token_usage();
+            let mut info = state.token_info().unwrap_or_default();
 
             info.last_token_usage = TokenUsage {
                 input_tokens: 0,

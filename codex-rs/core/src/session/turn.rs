@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use crate::client::ModelClientSession;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
+use crate::client_common::ToolsWireFormat;
 use crate::compact::InitialContextInjection;
 use crate::compact::run_inline_auto_compact_task;
 use crate::compact_remote::run_inline_remote_auto_compact_task;
@@ -1385,6 +1386,17 @@ async fn run_sampling_request(
             step_context.as_ref(),
             base_instructions.clone(),
         );
+        // Measure the fixed cost of the request we are about to send, so the
+        // context indicator divides by a number that was measured rather than
+        // by the `LEGACY_CONTEXT_BASELINE_TOKENS` constant. Priced in the form
+        // the client will serialize the tools in, which depends on the model
+        // and the provider together.
+        let tools_wire_format = ToolsWireFormat::for_request(
+            step_context.model_info.use_responses_lite,
+            step_context.turn.provider.capabilities().namespace_tools,
+        );
+        sess.record_context_baseline(prompt.context_baseline(tools_wire_format))
+            .await;
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),

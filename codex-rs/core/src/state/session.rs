@@ -18,6 +18,7 @@ use crate::session::session::SessionConfiguration;
 use crate::session::time_reminder::CurrentTimeReminderState;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
 use codex_history::ResponseItemEnvelope;
+use codex_protocol::protocol::ContextBaseline;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
@@ -141,6 +142,14 @@ impl SessionState {
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
         self.history.set_token_info(info);
+    }
+
+    pub(crate) fn set_context_baseline(&mut self, baseline: ContextBaseline) {
+        self.history.set_context_baseline(baseline);
+    }
+
+    pub(crate) fn note_estimated_token_usage(&mut self) {
+        self.history.note_estimated_token_usage();
     }
 
     pub(crate) fn set_reference_context_item(&mut self, item: Option<TurnContextItem>) {
