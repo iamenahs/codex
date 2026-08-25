@@ -75,6 +75,7 @@ use crate::terminal_title::SetTerminalTitleResult;
 use crate::terminal_title::clear_terminal_title;
 use crate::terminal_title::set_terminal_title;
 use crate::text_formatting::proper_join;
+use crate::token_usage::ContextBaseline;
 use crate::token_usage::TokenUsage;
 use crate::token_usage::TokenUsageInfo;
 use crate::version::CODEX_CLI_VERSION;
@@ -927,6 +928,14 @@ fn token_usage_info_from_app_server(token_usage: ThreadTokenUsage) -> TokenUsage
             reasoning_output_tokens: token_usage.last.reasoning_output_tokens,
         },
         model_context_window: token_usage.model_context_window,
+        context_baseline: token_usage
+            .context_baseline
+            .map(|baseline| ContextBaseline {
+                system_prompt_tokens: baseline.system_prompt_tokens,
+                tool_schema_tokens: baseline.tool_schema_tokens,
+                output_schema_tokens: baseline.output_schema_tokens,
+                tool_count: baseline.tool_count,
+            }),
     }
 }
 
@@ -1158,10 +1167,8 @@ impl ChatWidget {
     }
 
     fn context_remaining_percent(&self, info: &TokenUsageInfo) -> Option<i64> {
-        info.model_context_window.map(|window| {
-            info.last_token_usage
-                .percent_of_context_window_remaining(window)
-        })
+        info.model_context_window
+            .map(|window| info.percent_of_context_window_remaining(window))
     }
 
     fn context_used_tokens(&self, info: &TokenUsageInfo, percent_known: bool) -> Option<i64> {

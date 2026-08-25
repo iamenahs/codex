@@ -29,6 +29,7 @@ pub use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 pub use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::ContextBaseline as CoreContextBaseline;
 use codex_protocol::protocol::ThreadGoalStatus as CoreThreadGoalStatus;
 use codex_protocol::protocol::TokenUsage as CoreTokenUsage;
 use codex_protocol::protocol::TokenUsageInfo as CoreTokenUsageInfo;
@@ -1777,6 +1778,50 @@ pub struct ThreadTokenUsage {
     // TODO(aibrahim): make this not optional
     #[ts(type = "number | null")]
     pub model_context_window: Option<i64>,
+    /// What the part of the prompt the conversation cannot influence costs —
+    /// base instructions, tool schemas, output schema — as measured when the
+    /// request this event reports usage for was built.
+    ///
+    /// Null whenever no such measurement belongs to that request: before the
+    /// first one, for requests Codex builds without tools or an output schema
+    /// (compaction), and while `last` is a locally recomputed estimate rather
+    /// than a provider figure. Read null as "denominate against Codex's own
+    /// historical constant", not as "the previous value still applies".
+    ///
+    /// Nullable rather than optional, matching `model_context_window`, so the
+    /// generated TypeScript stays inside the export rules for non-params types.
+    #[serde(default)]
+    pub context_baseline: Option<ThreadContextBaseline>,
+}
+
+/// See `codex_protocol::protocol::ContextBaseline`. Approximate: priced with
+/// the same byte-density heuristic Codex uses for history estimation, so it
+/// describes a denominator and never replaces provider-reported usage.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadContextBaseline {
+    #[ts(type = "number")]
+    pub system_prompt_tokens: i64,
+    #[ts(type = "number")]
+    pub tool_schema_tokens: i64,
+    /// Zero when the request carries no response-format schema.
+    #[ts(type = "number")]
+    pub output_schema_tokens: i64,
+    /// How many model-visible tool specs were sent. Exact.
+    #[ts(type = "number")]
+    pub tool_count: i64,
+}
+
+impl From<CoreContextBaseline> for ThreadContextBaseline {
+    fn from(value: CoreContextBaseline) -> Self {
+        Self {
+            system_prompt_tokens: value.system_prompt_tokens,
+            tool_schema_tokens: value.tool_schema_tokens,
+            output_schema_tokens: value.output_schema_tokens,
+            tool_count: value.tool_count,
+        }
+    }
 }
 
 impl From<CoreTokenUsageInfo> for ThreadTokenUsage {
@@ -1785,6 +1830,7 @@ impl From<CoreTokenUsageInfo> for ThreadTokenUsage {
             total: value.total_token_usage.into(),
             last: value.last_token_usage.into(),
             model_context_window: value.model_context_window,
+            context_baseline: value.context_baseline.map(Into::into),
         }
     }
 }

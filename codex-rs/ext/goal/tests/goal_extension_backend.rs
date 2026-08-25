@@ -1393,6 +1393,7 @@ impl GoalExtensionHarness {
             total_token_usage: usage.clone(),
             last_token_usage: TokenUsage::default(),
             model_context_window: None,
+            ..TokenUsageInfo::default()
         };
         for contributor in self.registry.token_usage_contributors() {
             contributor

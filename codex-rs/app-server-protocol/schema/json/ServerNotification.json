@@ -4053,6 +4053,36 @@
       ],
       "type": "object"
     },
+    "ThreadContextBaseline": {
+      "description": "See `codex_protocol::protocol::ContextBaseline`. Approximate: priced with the same byte-density heuristic Codex uses for history estimation, so it describes a denominator and never replaces provider-reported usage.",
+      "properties": {
+        "outputSchemaTokens": {
+          "description": "Zero when the request carries no response-format schema.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "systemPromptTokens": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "toolCount": {
+          "description": "How many model-visible tool specs were sent. Exact.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "toolSchemaTokens": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "outputSchemaTokens",
+        "systemPromptTokens",
+        "toolCount",
+        "toolSchemaTokens"
+      ],
+      "type": "object"
+    },
     "ThreadDeletedNotification": {
       "properties": {
         "threadId": {
@@ -5458,6 +5488,18 @@
     },
     "ThreadTokenUsage": {
       "properties": {
+        "contextBaseline": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadContextBaseline"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "What the part of the prompt the conversation cannot influence costs — base instructions, tool schemas, output schema — as measured when the request this event reports usage for was built.\n\nNull whenever no such measurement belongs to that request: before the first one, for requests Codex builds without tools or an output schema (compaction), and while `last` is a locally recomputed estimate rather than a provider figure. Read null as \"denominate against Codex's own historical constant\", not as \"the previous value still applies\".\n\nNullable rather than optional, matching `model_context_window`, so the generated TypeScript stays inside the export rules for non-params types."
+        },
         "last": {
           "$ref": "#/definitions/TokenUsageBreakdown"
         },

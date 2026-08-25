@@ -337,14 +337,15 @@ impl StatusHistoryCell {
         let account = compose_account_display(account_display);
         let session_id = session_id.as_ref().map(std::string::ToString::to_string);
         let forked_from = forked_from.map(|id| id.to_string());
-        let default_usage = TokenUsage::default();
-        let (context_usage, context_window) = match token_info {
-            Some(info) => (&info.last_token_usage, info.model_context_window),
-            None => (&default_usage, config.model_context_window),
+        let default_info = TokenUsageInfo::default();
+        let info = token_info.unwrap_or(&default_info);
+        let context_window = match token_info {
+            Some(info) => info.model_context_window,
+            None => config.model_context_window,
         };
         let context_window = context_window.map(|window| StatusContextWindowData {
-            percent_remaining: context_usage.percent_of_context_window_remaining(window),
-            tokens_in_context: context_usage.tokens_in_context_window(),
+            percent_remaining: info.percent_of_context_window_remaining(window),
+            tokens_in_context: info.last_token_usage.tokens_in_context_window(),
             window,
         });
 

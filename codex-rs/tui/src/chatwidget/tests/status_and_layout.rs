@@ -143,6 +143,7 @@ async fn context_indicator_shows_used_tokens_when_window_unknown() {
         total_token_usage: token_usage.clone(),
         last_token_usage: token_usage,
         model_context_window: None,
+        ..TokenUsageInfo::default()
     };
 
     handle_token_count(&mut chat, Some(token_info));

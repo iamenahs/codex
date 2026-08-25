@@ -984,6 +984,151 @@ fn estimate_token_count_with_base_instructions_uses_provided_text() {
     assert_eq!(long_estimate - short_estimate, expected_delta);
 }
 
+/// The measured baseline is for display only. `estimate_token_count_*` feeds
+/// `recompute_token_usage`, which writes `last_token_usage.total_tokens` —
+/// the field `get_total_token_usage` reads and auto-compaction compares
+/// against its limit. Recording a baseline must therefore leave this estimate
+/// bit-for-bit unchanged, or measuring the context would move when Codex
+/// decides to compact.
+/// A baseline is only meaningful beside the usage of the request it was
+/// measured from. Staging it means a request that never completes cannot pair
+/// its baseline with the previous request's usage.
+#[test]
+fn a_staged_baseline_is_withheld_until_usage_arrives() {
+    let mut history = create_history_with_items(vec![assistant_msg("hi")]);
+    history.update_token_info(&usage_of(1_000), Some(272_000));
+    assert_eq!(
+        history.token_info().and_then(|info| info.context_baseline),
+        None,
+        "no request has completed with a baseline yet"
+    );
+
+    history.set_context_baseline(baseline_of(30_000));
+    assert_eq!(
+        history.token_info().and_then(|info| info.context_baseline),
+        None,
+        "the request has been built but its usage has not come back"
+    );
+
+    history.update_token_info(&usage_of(31_500), Some(272_000));
+    assert_eq!(
+        history
+            .token_info()
+            .and_then(|info| info.context_baseline)
+            .map(|baseline| baseline.fixed_tokens()),
+        Some(30_000),
+        "usage for that request has arrived, so the pair is complete"
+    );
+}
+
+/// After a compaction, `last_token_usage` is `estimate_token_count_with_base_
+/// instructions`, which omits the tool schemas. Dividing that by a baseline
+/// that counts them mixes two accountings, and the mismatch moves the reading
+/// further from the truth than the constant does. The baseline is withheld
+/// until a provider figure denominated the same way arrives.
+#[test]
+fn an_estimated_usage_figure_is_not_paired_with_a_measured_baseline() {
+    let window = 272_000;
+    let mut history = create_history_with_items(vec![assistant_msg("hi")]);
+    history.set_context_baseline(baseline_of(30_000));
+    history.update_token_info(&usage_of(130_000), Some(window));
+
+    let measured = history.token_info().expect("info");
+    assert_eq!(measured.baseline_tokens(), 30_000);
+
+    // Compaction recomputes the total locally; the estimate is short by the
+    // tool surface it does not price.
+    history.note_estimated_token_usage();
+    let mut estimated = history.token_info().expect("info");
+    estimated.last_token_usage = usage_of(105_000);
+
+    assert_eq!(estimated.context_baseline, None);
+    assert_eq!(
+        estimated.baseline_tokens(),
+        codex_protocol::protocol::LEGACY_CONTEXT_BASELINE_TOKENS,
+        "an estimated total falls back to the constant it is denominated against"
+    );
+    assert_eq!(estimated.percent_of_context_window_remaining(window), 64);
+
+    // Provider usage for the next request restores the pairing.
+    history.set_context_baseline(baseline_of(30_000));
+    history.update_token_info(&usage_of(130_000), Some(window));
+    assert_eq!(
+        history.token_info().expect("info").baseline_tokens(),
+        30_000
+    );
+}
+
+/// Local compaction sends a request of its own — `Prompt { input,
+/// base_instructions, ..Default::default() }` in `compact.rs`, so no tools and
+/// no output schema — and publishes the provider usage for it. It stages no
+/// baseline, so carrying the previous request's forward would divide that
+/// usage by a tool payload the compaction request never sent.
+#[test]
+fn a_request_that_stages_no_baseline_does_not_inherit_the_previous_one() {
+    let window = 272_000;
+    let mut history = create_history_with_items(vec![assistant_msg("hi")]);
+
+    // A sampling request: its tools are measured, and the pair is published.
+    history.set_context_baseline(baseline_of(30_000));
+    history.update_token_info(&usage_of(240_000), Some(window));
+    let measured = history.token_info().expect("info");
+    assert_eq!(measured.baseline_tokens(), 30_000);
+    assert_eq!(measured.percent_of_context_window_remaining(window), 13);
+
+    // The compaction request that follows reports usage without staging one.
+    history.update_token_info(&usage_of(240_000), Some(window));
+    let compaction = history.token_info().expect("info");
+    assert_eq!(compaction.context_baseline, None);
+    assert_eq!(
+        compaction.baseline_tokens(),
+        codex_protocol::protocol::LEGACY_CONTEXT_BASELINE_TOKENS,
+        "a request with no tools is denominated against the constant"
+    );
+    assert_eq!(compaction.percent_of_context_window_remaining(window), 12);
+}
+
+fn usage_of(total_tokens: i64) -> TokenUsage {
+    TokenUsage {
+        total_tokens,
+        ..TokenUsage::default()
+    }
+}
+
+fn baseline_of(tool_schema_tokens: i64) -> ContextBaseline {
+    ContextBaseline {
+        system_prompt_tokens: 0,
+        tool_schema_tokens,
+        output_schema_tokens: 0,
+        tool_count: 24,
+    }
+}
+
+#[test]
+fn recording_a_baseline_does_not_move_the_history_estimate() {
+    let base = BaseInstructions {
+        text: "instructions".to_string(),
+        provenance: None,
+    };
+    let mut history = create_history_with_items(vec![assistant_msg("hello from history")]);
+
+    let before = history
+        .estimate_token_count_with_base_instructions(&base)
+        .expect("token estimate");
+
+    history.set_context_baseline(ContextBaseline {
+        system_prompt_tokens: 4,
+        tool_schema_tokens: 5_000,
+        output_schema_tokens: 250,
+        tool_count: 24,
+    });
+    let after = history
+        .estimate_token_count_with_base_instructions(&base)
+        .expect("token estimate");
+
+    assert_eq!(before, after);
+}
+
 #[test]
 fn remove_first_item_removes_matching_output_for_function_call() {
     let items = vec![

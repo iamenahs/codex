@@ -135,6 +135,7 @@ pub fn create_fake_rollout_with_token_usage(
                 codex_rollout_budget_units: None,
             },
             model_context_window: Some(200_000),
+            ..TokenUsageInfo::default()
         }),
         rate_limits: None,
     }))?;

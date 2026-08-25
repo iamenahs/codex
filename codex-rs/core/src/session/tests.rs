@@ -2691,6 +2691,7 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
             codex_rollout_budget_units: None,
         },
         model_context_window: Some(1_000),
+        ..TokenUsageInfo::default()
     };
     let info2 = TokenUsageInfo {
         total_token_usage: TokenUsage {
@@ -2712,6 +2713,7 @@ async fn record_initial_history_seeds_token_info_from_rollout() {
             codex_rollout_budget_units: None,
         },
         model_context_window: Some(2_000),
+        ..TokenUsageInfo::default()
     };
 
     rollout_items.push(RolloutItem::EventMsg(EventMsg::TokenCount(
@@ -2802,6 +2804,7 @@ async fn recompute_token_usage_updates_model_context_window() {
             total_token_usage: TokenUsage::default(),
             last_token_usage: TokenUsage::default(),
             model_context_window: Some(258_400),
+            ..TokenUsageInfo::default()
         }));
     }
 
@@ -2912,6 +2915,7 @@ async fn record_token_usage_info_notifies_extension_contributors() {
                 total_token_usage: first_usage.clone(),
                 last_token_usage: first_usage,
                 model_context_window: turn_context.model_context_window(),
+                ..TokenUsageInfo::default()
             },
             saw_session_store: true,
             saw_thread_store: true,
@@ -2924,6 +2928,7 @@ async fn record_token_usage_info_notifies_extension_contributors() {
                 total_token_usage: expected_total_usage,
                 last_token_usage: second_usage,
                 model_context_window: turn_context.model_context_window(),
+                ..TokenUsageInfo::default()
             },
             saw_session_store: true,
             saw_thread_store: true,
@@ -10765,6 +10770,7 @@ async fn set_total_token_usage(sess: &Session, total_token_usage: TokenUsage) {
         total_token_usage,
         last_token_usage: TokenUsage::default(),
         model_context_window: None,
+        ..TokenUsageInfo::default()
     }));
 }
 

@@ -12,6 +12,7 @@ use super::X_OPENAI_SUBAGENT_HEADER;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
+use crate::client_common::ToolsWireFormat;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::test_support::TestCodexResponsesRequestKind;
 use crate::test_support::responses_metadata as test_responses_metadata;
@@ -60,6 +61,8 @@ use codex_rollout_trace::RawTraceEventPayload;
 use codex_rollout_trace::RolloutTrace;
 use codex_rollout_trace::TraceWriter;
 use codex_rollout_trace::replay_bundle;
+use codex_tools::ToolSpec;
+use codex_utils_output_truncation::approx_token_count;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -1045,4 +1048,135 @@ async fn non_chatgpt_codex_endpoints_omit_attestation_generation() {
         None,
     );
     assert_eq!(attestation_calls.load(Ordering::Relaxed), 0);
+}
+
+/// The number `LEGACY_CONTEXT_BASELINE_TOKENS` was standing in for: what the
+/// request actually carries before the conversation is counted.
+#[test]
+fn prompt_context_baseline_prices_instructions_tools_and_output_schema() {
+    let prompt = Prompt {
+        base_instructions: BaseInstructions {
+            text: "x".repeat(1_000),
+            provenance: None,
+        },
+        tools: vec![sized_tool("alpha"), sized_tool("beta")].into(),
+        output_schema: Some(json!({ "type": "object", "description": "y".repeat(600) })),
+        ..Default::default()
+    };
+
+    let baseline = prompt.context_baseline(ToolsWireFormat::PerTool);
+    assert_eq!(baseline.tool_count, 2);
+    // 1,000 bytes at the shared 4-bytes-per-token heuristic.
+    assert_eq!(baseline.system_prompt_tokens, 250);
+    assert!(
+        baseline.tool_schema_tokens > 200,
+        "two 400-byte descriptions must not price as nothing: {}",
+        baseline.tool_schema_tokens
+    );
+    assert!(
+        baseline.output_schema_tokens > 140,
+        "a 600-byte schema must not price as nothing: {}",
+        baseline.output_schema_tokens
+    );
+    // The request sends the schema inside a format wrapper carrying a type, a
+    // name and the strict flag, so the priced figure must exceed the bare
+    // schema's own size rather than match it.
+    let bare_schema_tokens = i64::try_from(approx_token_count(
+        &serde_json::to_string(prompt.output_schema.as_ref().expect("schema")).expect("json"),
+    ))
+    .expect("fits");
+    assert!(
+        baseline.output_schema_tokens > bare_schema_tokens,
+        "the format wrapper must be priced too: {} vs bare {bare_schema_tokens}",
+        baseline.output_schema_tokens
+    );
+    assert_eq!(
+        baseline.fixed_tokens(),
+        baseline.system_prompt_tokens + baseline.tool_schema_tokens + baseline.output_schema_tokens
+    );
+}
+
+/// The tool surface is not one size. A provider that namespaces tools receives
+/// a single wrapper instead of one envelope per spec, so pricing the specs
+/// as-written would misstate what that request costs. The measurement follows
+/// the form the client will actually send.
+#[test]
+fn prompt_context_baseline_prices_tools_in_the_form_they_are_sent() {
+    let tools: Vec<ToolSpec> = (0..8).map(|i| sized_tool(&format!("tool_{i}"))).collect();
+    let prompt = Prompt {
+        tools: tools.into(),
+        ..Default::default()
+    };
+
+    let per_tool = prompt
+        .context_baseline(ToolsWireFormat::PerTool)
+        .tool_schema_tokens;
+    let namespaced = prompt
+        .context_baseline(ToolsWireFormat::Namespaced)
+        .tool_schema_tokens;
+
+    assert_ne!(
+        per_tool, namespaced,
+        "the two wire forms must not be assumed to cost the same"
+    );
+}
+
+/// The form is chosen by the model and the provider together, exactly as
+/// `build_responses_request` chooses it.
+#[test]
+fn tools_wire_format_follows_the_request_branch() {
+    assert_eq!(
+        ToolsWireFormat::for_request(true, true),
+        ToolsWireFormat::Namespaced
+    );
+    assert_eq!(
+        ToolsWireFormat::for_request(true, false),
+        ToolsWireFormat::PerTool
+    );
+    assert_eq!(
+        ToolsWireFormat::for_request(false, true),
+        ToolsWireFormat::PerTool
+    );
+    assert_eq!(
+        ToolsWireFormat::for_request(false, false),
+        ToolsWireFormat::PerTool
+    );
+}
+
+/// A prompt with no instructions, no tools and no schema has no fixed cost
+/// worth the name — the tool payload is still sent, but it is the two bytes of
+/// an empty array. The measurement reports what it measured rather than
+/// falling back to a guess: an absent `ContextBaseline` means "not measured
+/// yet", and a measured near-zero must not be confused with it.
+#[test]
+fn prompt_context_baseline_is_near_zero_for_an_empty_prompt() {
+    let prompt = Prompt {
+        base_instructions: BaseInstructions {
+            text: String::new(),
+            provenance: None,
+        },
+        tools: Vec::new().into(),
+        ..Default::default()
+    };
+    let baseline = prompt.context_baseline(ToolsWireFormat::PerTool);
+    assert_eq!(baseline.system_prompt_tokens, 0);
+    assert_eq!(baseline.output_schema_tokens, 0);
+    assert_eq!(baseline.tool_count, 0);
+    assert!(
+        baseline.fixed_tokens() <= 1,
+        "an empty prompt must not be priced as a real baseline: {}",
+        baseline.fixed_tokens()
+    );
+}
+
+/// A tool spec with a description long enough that dropping it would show up.
+fn sized_tool(name: &str) -> ToolSpec {
+    ToolSpec::Function(codex_tools::ResponsesApiTool {
+        name: name.to_string(),
+        description: "d".repeat(400),
+        strict: false,
+        defer_loading: None,
+        parameters: codex_tools::JsonSchema::default(),
+        output_schema: None,
+    })
 }

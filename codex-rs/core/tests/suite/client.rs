@@ -3222,7 +3222,38 @@ async fn token_count_includes_rate_limits_snapshot() {
         _ => unreachable!(),
     };
     // Assert full JSON for the final token count event (usage + rate limits)
-    let final_json = serde_json::to_value(&final_payload).unwrap();
+    let mut final_json = serde_json::to_value(&final_payload).unwrap();
+
+    // The measured baseline moves whenever the built-in prompt or the tool set
+    // does, so assert its shape here rather than pinning sizes that any
+    // unrelated prompt edit would break, and take it out of the exact
+    // comparison below.
+    let context_baseline = final_json["info"]
+        .as_object_mut()
+        .expect("info is an object")
+        .remove("context_baseline")
+        .expect("a request was built, so the baseline was measured");
+    assert!(
+        context_baseline["system_prompt_tokens"]
+            .as_i64()
+            .is_some_and(|tokens| tokens > 0),
+        "base instructions must be priced: {context_baseline}"
+    );
+    assert!(
+        context_baseline["tool_schema_tokens"]
+            .as_i64()
+            .is_some_and(|tokens| tokens > 0),
+        "the tool surface must be priced: {context_baseline}"
+    );
+    assert!(
+        context_baseline["tool_count"]
+            .as_i64()
+            .is_some_and(|count| count > 0),
+        "tools were sent, so they must be counted: {context_baseline}"
+    );
+    // This turn asks for no response format.
+    pretty_assertions::assert_eq!(context_baseline["output_schema_tokens"], json!(0));
+
     pretty_assertions::assert_eq!(
         final_json,
         json!({

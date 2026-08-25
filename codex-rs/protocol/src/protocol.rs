@@ -2097,13 +2097,74 @@ pub struct TokenUsage {
     pub codex_rollout_budget_units: Option<serde_json::Number>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+/// An estimate of part of the fixed cost of a request: the components the
+/// conversation cannot influence that can be priced from the `Prompt` itself.
+///
+/// It covers the base instructions, the tool payload and the response format.
+/// It does not cover fixed context injected into the conversation before the
+/// prompt is built — developer instructions, plugin and app descriptions, skill
+/// fragments, extension contributions — which reach the model as ordinary input
+/// items and are indistinguishable here from what the user typed.
+///
+/// Two separate reasons this is not the fixed cost, and both matter:
+///
+/// 1. The categories are a subset of the fixed context, as above.
+/// 2. Each category is priced with `approx_token_count` — `ceil(bytes / 4)`,
+///    the byte-density heuristic Codex already uses for history estimation and
+///    truncation. That can land either side of what a tokenizer would produce,
+///    depending on the content, so a category's estimate is not bounded in
+///    either direction.
+///
+/// Together those mean this is a heuristic, not a bound: it is expected to be
+/// closer than a constant for a session with a large tool surface, and it is
+/// not guaranteed to be closer in any individual case. It is never a substitute
+/// for provider-reported usage. Use [`context_baseline_tokens`] to turn it into
+/// a denominator.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct ContextBaseline {
+    /// Approximate tokens of the base instructions sent with every request.
+    #[ts(type = "number")]
+    pub system_prompt_tokens: i64,
+    /// Approximate tokens of the model-visible tool schemas, priced in the
+    /// wire form the request will carry them in.
+    #[ts(type = "number")]
+    pub tool_schema_tokens: i64,
+    /// Approximate tokens of the response-format schema, when the request
+    /// carries one. Zero when it does not.
+    #[ts(type = "number")]
+    pub output_schema_tokens: i64,
+    /// How many model-visible tool specs were sent. Exact.
+    #[ts(type = "number")]
+    pub tool_count: i64,
+}
+
+impl ContextBaseline {
+    /// Tokens the conversation cannot influence: instructions, tools, and the
+    /// output schema.
+    pub fn fixed_tokens(&self) -> i64 {
+        self.system_prompt_tokens
+            .saturating_add(self.tool_schema_tokens)
+            .saturating_add(self.output_schema_tokens)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct TokenUsageInfo {
     pub total_token_usage: TokenUsage,
     pub last_token_usage: TokenUsage,
     // TODO(aibrahim): make this not optional
     #[ts(type = "number | null")]
     pub model_context_window: Option<i64>,
+    /// What the fixed part of the prompt actually costs, as of the most
+    /// recently built request. `None` before the first request, and for a
+    /// session whose producer predates this field.
+    ///
+    /// Re-measured per request rather than per session: the tool surface is
+    /// not fixed, and enabling a plugin or connecting an MCP server moves it —
+    /// as does switching to a model whose requests use a different wire form
+    /// for the tool payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_baseline: Option<ContextBaseline>,
 }
 
 impl TokenUsageInfo {
@@ -2119,9 +2180,8 @@ impl TokenUsageInfo {
         let mut info = match info {
             Some(info) => info.clone(),
             None => Self {
-                total_token_usage: TokenUsage::default(),
-                last_token_usage: TokenUsage::default(),
                 model_context_window,
+                ..Self::default()
             },
         };
         if let Some(last) = last {
@@ -2131,6 +2191,25 @@ impl TokenUsageInfo {
             info.model_context_window = Some(model_context_window);
         }
         Some(info)
+    }
+
+    /// The baseline this session's percentage divides by. See
+    /// [`context_baseline_tokens`] for why the measurement is floored.
+    pub fn baseline_tokens(&self) -> i64 {
+        context_baseline_tokens(self.context_baseline)
+    }
+
+    /// Percent of the window the conversation can still grow into.
+    ///
+    /// Prefer this over [`TokenUsage::percent_of_context_window_remaining`]
+    /// wherever a `TokenUsageInfo` is in hand: it is the only entry point that
+    /// can supply a measured baseline.
+    pub fn percent_of_context_window_remaining(&self, context_window: i64) -> i64 {
+        self.last_token_usage
+            .percent_of_context_window_remaining_with_baseline(
+                context_window,
+                self.baseline_tokens(),
+            )
     }
 
     pub fn append_last_usage(&mut self, last: &TokenUsage) {
@@ -2155,9 +2234,8 @@ impl TokenUsageInfo {
 
     pub fn full_context_window(context_window: i64) -> Self {
         let mut info = Self {
-            total_token_usage: TokenUsage::default(),
-            last_token_usage: TokenUsage::default(),
             model_context_window: Some(context_window),
+            ..Self::default()
         };
         info.fill_to_context_window(context_window);
         info
@@ -2237,8 +2315,63 @@ pub struct SpendControlLimitSnapshot {
     pub resets_at: i64,
 }
 
-// Includes prompts, tools and space to call compact.
-const BASELINE_TOKENS: i64 = 12000;
+/// Historical stand-in for the fixed part of a prompt. Retained as a floor
+/// under the measured figure, and as the whole answer for a session that has
+/// not built a request yet; see [`context_baseline_tokens`].
+///
+/// Its previous comment read "includes prompts, tools and space to call
+/// compact". The first two are what [`ContextBaseline`] now measures. The
+/// third was never true of this constant: it is read only by
+/// `percent_of_context_window_remaining`, which is display. Auto-compaction
+/// reserves its own headroom, out of `auto_compact_token_limit` plus the
+/// token-budget fallback buffer, and has never consulted this value.
+pub const LEGACY_CONTEXT_BASELINE_TOKENS: i64 = 12000;
+
+/// The baseline to divide by, given whatever estimate is available.
+///
+/// [`ContextBaseline`] covers only part of a request's fixed cost, and prices
+/// that part heuristically — see there. So the estimate can land below the true
+/// fixed cost, which is the common case for a session carrying injected
+/// context, and dividing by a figure that low understates the percentage by
+/// more than the historical constant does.
+///
+/// Flooring the estimate at that constant means the denominator never drops
+/// below the value shipping today. Sessions whose measured components alone
+/// exceed 12,000 — a wide tool surface, several MCP servers — get a denominator
+/// derived from what was actually sent; every other session keeps exactly the
+/// behaviour it has now. This is a heuristic improvement aimed at the case the
+/// constant serves worst, not a guarantee about any individual session.
+pub fn context_baseline_tokens(measured: Option<ContextBaseline>) -> i64 {
+    measured.map_or(LEGACY_CONTEXT_BASELINE_TOKENS, |baseline| {
+        baseline.fixed_tokens().max(LEGACY_CONTEXT_BASELINE_TOKENS)
+    })
+}
+
+/// Percent of `context_window` the conversation can still grow into.
+///
+/// Both sides of the fraction are normalized by `baseline`, the tokens the
+/// conversation cannot influence, so a session that holds nothing but the fixed
+/// cost reads 100% and the reading trends to 0% as the window fills.
+///
+/// Free-standing because `codex-tui` keeps its own token types for its own
+/// persistence and must not carry a second copy of this arithmetic.
+pub fn percent_of_context_window_remaining(
+    tokens_in_context_window: i64,
+    context_window: i64,
+    baseline: i64,
+) -> i64 {
+    let baseline = baseline.max(0);
+    if context_window <= baseline {
+        return 0;
+    }
+
+    let effective_window = context_window - baseline;
+    let used = (tokens_in_context_window - baseline).max(0);
+    let remaining = (effective_window - used).max(0);
+    ((remaining as f64 / effective_window as f64) * 100.0)
+        .clamp(0.0, 100.0)
+        .round() as i64
+}
 
 impl TokenUsage {
     pub fn is_zero(&self) -> bool {
@@ -2264,25 +2397,36 @@ impl TokenUsage {
 
     /// Estimate the remaining user-controllable percentage of the model's context window.
     ///
+    /// Prefer [`TokenUsageInfo::percent_of_context_window_remaining`], which
+    /// supplies the measured baseline. This entry point keeps the historical
+    /// constant for callers that have no `TokenUsageInfo`.
+    pub fn percent_of_context_window_remaining(&self, context_window: i64) -> i64 {
+        self.percent_of_context_window_remaining_with_baseline(
+            context_window,
+            LEGACY_CONTEXT_BASELINE_TOKENS,
+        )
+    }
+
+    /// Estimate the remaining user-controllable percentage of the model's context window.
+    ///
     /// `context_window` is the total size of the model's context window.
-    /// `BASELINE_TOKENS` should capture tokens that are always present in
-    /// the context (e.g., system prompt and fixed tool instructions) so that
-    /// the percentage reflects the portion the user can influence.
+    /// `baseline` is the tokens always present in the context — the base
+    /// instructions and the tool schemas — so that the percentage reflects the
+    /// portion the user can influence.
     ///
     /// This normalizes both the numerator and denominator by subtracting the
     /// baseline, so immediately after the first prompt the UI shows 100% left
     /// and trends toward 0% as the user fills the effective window.
-    pub fn percent_of_context_window_remaining(&self, context_window: i64) -> i64 {
-        if context_window <= BASELINE_TOKENS {
-            return 0;
-        }
-
-        let effective_window = context_window - BASELINE_TOKENS;
-        let used = (self.tokens_in_context_window() - BASELINE_TOKENS).max(0);
-        let remaining = (effective_window - used).max(0);
-        ((remaining as f64 / effective_window as f64) * 100.0)
-            .clamp(0.0, 100.0)
-            .round() as i64
+    pub fn percent_of_context_window_remaining_with_baseline(
+        &self,
+        context_window: i64,
+        baseline: i64,
+    ) -> i64 {
+        percent_of_context_window_remaining(
+            self.tokens_in_context_window(),
+            context_window,
+            baseline,
+        )
     }
 
     /// In-place element-wise sum of token counts.
@@ -5997,9 +6141,8 @@ mod tests {
     #[test]
     fn token_usage_info_new_or_append_updates_context_window_when_provided() {
         let initial = Some(TokenUsageInfo {
-            total_token_usage: TokenUsage::default(),
-            last_token_usage: TokenUsage::default(),
             model_context_window: Some(258_400),
+            ..TokenUsageInfo::default()
         });
         let last = Some(TokenUsage {
             input_tokens: 10,
@@ -6020,9 +6163,8 @@ mod tests {
     #[test]
     fn token_usage_info_new_or_append_preserves_context_window_when_not_provided() {
         let initial = Some(TokenUsageInfo {
-            total_token_usage: TokenUsage::default(),
-            last_token_usage: TokenUsage::default(),
             model_context_window: Some(258_400),
+            ..TokenUsageInfo::default()
         });
         let last = Some(TokenUsage {
             input_tokens: 10,
@@ -6039,5 +6181,177 @@ mod tests {
                 .expect("new_or_append should return info");
 
         assert_eq!(info.model_context_window, Some(258_400));
+    }
+
+    /// `percent_of_context_window_remaining` documents its own contract:
+    /// "immediately after the first prompt the UI shows 100% left". That holds
+    /// only while the fixed cost really is 12,000. A session whose measured
+    /// subtotal alone exceeds the constant reads below 100% and stays
+    /// understated for its whole life, because the denominator subtracts a
+    /// baseline smaller than the one the model was actually sent.
+    ///
+    /// The usage here is set to the measured subtotal plus a short message, so
+    /// it is the constructed best case: a real session also carries injected
+    /// context this measurement cannot see, and would read below 100%.
+    #[test]
+    fn a_fresh_session_reads_full_only_with_a_measured_baseline() {
+        let window = 272_000;
+        // A fresh session: the fixed cost, plus a short first message.
+        let usage = TokenUsage {
+            total_tokens: 31_500,
+            ..TokenUsage::default()
+        };
+        let baseline = ContextBaseline {
+            system_prompt_tokens: 3_200,
+            tool_schema_tokens: 28_000,
+            output_schema_tokens: 0,
+            tool_count: 96,
+        };
+
+        let guessed = TokenUsageInfo {
+            last_token_usage: usage.clone(),
+            model_context_window: Some(window),
+            ..TokenUsageInfo::default()
+        };
+        let measured = TokenUsageInfo {
+            last_token_usage: usage,
+            model_context_window: Some(window),
+            context_baseline: Some(baseline),
+            ..TokenUsageInfo::default()
+        };
+
+        assert_eq!(guessed.baseline_tokens(), 12_000);
+        assert_eq!(measured.baseline_tokens(), 31_200);
+        assert_eq!(guessed.percent_of_context_window_remaining(window), 93);
+        assert_eq!(measured.percent_of_context_window_remaining(window), 100);
+    }
+
+    /// The estimate covers only part of the fixed cost: context injected into
+    /// the conversation — developer instructions, plugins, skills — is priced
+    /// by none of its terms. An estimate below the constant is the signature of
+    /// a session whose fixed cost this cannot see, so the constant holds as a
+    /// floor and the reading is unchanged.
+    #[test]
+    fn a_measured_subtotal_below_the_constant_changes_nothing() {
+        let window = 272_000;
+        let usage = TokenUsage {
+            total_tokens: 141_000,
+            ..TokenUsage::default()
+        };
+        let subtotal = ContextBaseline {
+            system_prompt_tokens: 3_200,
+            tool_schema_tokens: 1_800,
+            output_schema_tokens: 0,
+            tool_count: 6,
+        };
+        assert!(subtotal.fixed_tokens() < LEGACY_CONTEXT_BASELINE_TOKENS);
+
+        let guessed = TokenUsageInfo {
+            last_token_usage: usage.clone(),
+            model_context_window: Some(window),
+            ..TokenUsageInfo::default()
+        };
+        let measured = TokenUsageInfo {
+            last_token_usage: usage,
+            model_context_window: Some(window),
+            context_baseline: Some(subtotal),
+            ..TokenUsageInfo::default()
+        };
+
+        assert_eq!(measured.baseline_tokens(), LEGACY_CONTEXT_BASELINE_TOKENS);
+        assert_eq!(
+            measured.percent_of_context_window_remaining(window),
+            guessed.percent_of_context_window_remaining(window)
+        );
+    }
+
+    /// The floor is one-directional: it may only raise the baseline, so the
+    /// denominator never drops below the value shipping today. That is a
+    /// statement about the denominator, not about accuracy — the estimate
+    /// itself can sit either side of the true fixed cost.
+    #[test]
+    fn the_floor_never_lowers_the_baseline() {
+        for tool_schema_tokens in [0, 1_000, 11_999, 12_000, 12_001, 250_000] {
+            let baseline = ContextBaseline {
+                system_prompt_tokens: 0,
+                tool_schema_tokens,
+                output_schema_tokens: 0,
+                tool_count: 1,
+            };
+            let resolved = context_baseline_tokens(Some(baseline));
+            assert!(
+                resolved >= LEGACY_CONTEXT_BASELINE_TOKENS,
+                "{tool_schema_tokens} resolved to {resolved}"
+            );
+            assert_eq!(
+                resolved,
+                baseline.fixed_tokens().max(LEGACY_CONTEXT_BASELINE_TOKENS)
+            );
+        }
+    }
+
+    /// Nothing changes for a session that has not built a request yet, or for
+    /// a producer that predates the field.
+    #[test]
+    fn an_absent_baseline_keeps_the_historical_constant() {
+        let info = TokenUsageInfo {
+            last_token_usage: TokenUsage {
+                total_tokens: 50_000,
+                ..TokenUsage::default()
+            },
+            model_context_window: Some(272_000),
+            ..TokenUsageInfo::default()
+        };
+        assert_eq!(info.baseline_tokens(), LEGACY_CONTEXT_BASELINE_TOKENS);
+        assert_eq!(
+            info.percent_of_context_window_remaining(272_000),
+            info.last_token_usage
+                .percent_of_context_window_remaining(272_000)
+        );
+    }
+
+    /// A tool surface that fills the window on its own leaves nothing for the
+    /// conversation, and must not produce a negative or over-100 percentage.
+    #[test]
+    fn baseline_at_or_beyond_the_window_is_zero_remaining() {
+        let info = TokenUsageInfo {
+            last_token_usage: TokenUsage::default(),
+            model_context_window: Some(16_000),
+            context_baseline: Some(ContextBaseline {
+                system_prompt_tokens: 8_000,
+                tool_schema_tokens: 12_000,
+                output_schema_tokens: 0,
+                tool_count: 40,
+            }),
+            ..TokenUsageInfo::default()
+        };
+        assert_eq!(info.percent_of_context_window_remaining(16_000), 0);
+    }
+
+    #[test]
+    fn context_baseline_survives_a_usage_append() {
+        // Above the floor, so the resolved baseline also proves the measured
+        // figure is what flows through rather than the constant.
+        let baseline = ContextBaseline {
+            system_prompt_tokens: 3_000,
+            tool_schema_tokens: 14_000,
+            output_schema_tokens: 250,
+            tool_count: 12,
+        };
+        let existing = Some(TokenUsageInfo {
+            context_baseline: Some(baseline),
+            ..TokenUsageInfo::default()
+        });
+        let appended = TokenUsageInfo::new_or_append(
+            &existing,
+            &Some(TokenUsage {
+                total_tokens: 900,
+                ..TokenUsage::default()
+            }),
+            Some(272_000),
+        )
+        .expect("info");
+        assert_eq!(appended.context_baseline, Some(baseline));
+        assert_eq!(appended.baseline_tokens(), 17_250);
     }
 }
